@@ -11,7 +11,14 @@ RUN groupadd --system --gid 1001 appuser \
 WORKDIR /app
 
 COPY --chown=appuser:appuser requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+
+# --- CAPA NLP ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && pip install --no-cache-dir -r requirements.txt \
+    && python -m spacy download es_core_news_sm \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --chown=appuser:appuser app ./app
 

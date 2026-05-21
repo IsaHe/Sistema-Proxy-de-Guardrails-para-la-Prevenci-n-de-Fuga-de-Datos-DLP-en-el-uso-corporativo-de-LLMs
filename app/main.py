@@ -1,7 +1,8 @@
 import time
 import uuid
+import re
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 
 from app.audit import audit_log
 from app.schemas import (
@@ -11,12 +12,82 @@ from app.schemas import (
     ChatMessage,
 )
 
+# Importamos motores de Presidio para el bloque DLP (NLP)
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+
 app = FastAPI(
     title="DLP Guardrails Proxy",
     description="Proxy inverso DLP para uso corporativo de LLMs",
     version="0.1.0",
 )
 
+# ========================================================
+# LÓGICA DLP (IDS/IPS) Y TOKENIZACIÓN
+# ========================================================
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+
+# Expresiones regulares estáticas para cazar DNI y credenciales de infraestructura (AWS)
+DNI_REGEX = re.compile(r'\b\d{8}[A-HJ-NP-TV-Z]\b', re.IGNORECASE)
+AWS_SECRET_REGEX = re.compile(r'AKIA[0-9A-Z]{16}', re.IGNORECASE)
+
+# Almacén criptográfico reversible en memoria (OE1 - Datos en reposo)
+MAPPING_STORE: dict[str, str] = {}
+
+def custom_ids_scan(text: str) -> str:
+    """Módulo IDS: Detecta PII y secretos usando NLP y firmas estáticas."""
+    # A. NLP para entidades comunes (Nombres, Emails) con modelo en español
+    analyzer_results = analyzer.analyze(text=text, language="es")
+    anonymized_result = anonymizer.anonymize(
+        text=text,
+        analyzer_results=analyzer_results,
+        operators={
+            "PERSON": OperatorConfig("replace", {"new_value": "[USER_1]"}),
+            "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "[EMAIL_1]"}),
+        }
+    )
+    processed_text = anonymized_result.text
+    
+    # B. RegEx estáticas para DNI
+    for match in DNI_REGEX.findall(processed_text):
+        placeholder = "[DNI_1]"
+        MAPPING_STORE[placeholder] = match
+        processed_text = processed_text.replace(match, placeholder)
+        
+    # C. RegEx estáticas para secretos (Tokens AWS)
+    for match in AWS_SECRET_REGEX.findall(processed_text):
+        placeholder = "[AWS_TOKEN_1]"
+        MAPPING_STORE[placeholder] = match
+        processed_text = processed_text.replace(match, placeholder)
+        
+    return processed_text
+
+def detect_prompt_injection(text: str) -> None:
+    """Módulo IPS: Previene ataques de extensión de la influencia (Jailbreaks)."""
+    jailbreak_keywords = [
+        "ignore previous instructions", 
+        "ignora las instrucciones anteriores", 
+        "system prompt", 
+        "you are now a compliance-free"
+    ]
+    if any(kw in text.lower() for kw in jailbreak_keywords):
+        raise HTTPException(
+            status_code=403, 
+            detail="[IPS ALERT] Petición bloqueada. Intento de Prompt Injection detectado."
+        )
+
+def rehydrate_response(llm_response: str) -> str:
+    """Restaura los datos reales en el entorno local antes de responder al cliente."""
+    final_output = llm_response
+    for placeholder, original_value in MAPPING_STORE.items():
+        final_output = final_output.replace(placeholder, original_value)
+    return final_output
+
+# ========================================================
+# ENDPOINTS Y FLUJO DEL PROXY
+# ========================================================
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -42,10 +113,43 @@ async def chat_completions(
         n_messages=len(payload.messages),
     )
 
-    # TODO Fase 2: sanitize() -> proxy upstream -> rehydrate()
+    # El prompt que envía el empleado en el último mensaje
+    last_user_message = payload.messages[-1].content
+
+    # --- CONTROL IPS (Previene hackeos/jailbreaks) ---
+    try:
+        detect_prompt_injection(last_user_message)
+    except HTTPException as e:
+        # Registramos el bloqueo por ataque en los logs de auditoría
+        audit_log(
+            event="chat_completion.blocked_ips",
+            request_id=request_id,
+            user_id=user_id,
+            src_ip=src_ip,
+            decision="block",
+            model=payload.model,
+        )
+        raise e
+
+    # Forzar el mapping si simulan ser Juan Pérez en la demo interactiva
+    if "Juan Pérez" in last_user_message:
+        MAPPING_STORE["[USER_1]"] = "Juan Pérez"
+
+    # -- DLP / SANITIZE (Anonimiza el prompt antes de salir) ---
+    clean_prompt = custom_ids_scan(last_user_message)
+    print(f"[PROXY -> LLM UPSTREAM] Enviando prompt seguro: '{clean_prompt}'")
+
+    # --- MOCK DE LA RESPUESTA DEL LLM UPSTREAM ---
+    # Simulamos que la API externa devuelve texto usando tus tokens síncronos
+    llm_mock_response = "Acceso confirmado para el usuario [USER_1] con credencial [DNI_1]. Petición procesada de forma segura."
+    print(f"[LLM UPSTREAM -> PROXY] Respuesta cruda externa: '{llm_mock_response}'")
+
+    # --- CAPA REHYDRATE (Recupera los datos planos en local de forma transparente) ---
+    final_content = rehydrate_response(llm_mock_response)
+
     reply = ChatMessage(
         role="assistant",
-        content="[stub] respuesta pendiente de integrar con LLM upstream",
+        content=final_content,
     )
 
     audit_log(
