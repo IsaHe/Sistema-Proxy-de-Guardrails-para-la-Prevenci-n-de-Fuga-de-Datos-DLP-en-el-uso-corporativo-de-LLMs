@@ -14,6 +14,7 @@ from app.schemas import (
 
 # Importamos motores de Presidio para el bloque DLP (NLP)
 from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
@@ -26,7 +27,12 @@ app = FastAPI(
 # ========================================================
 # LÓGICA DLP (IDS/IPS) Y TOKENIZACIÓN
 # ========================================================
-analyzer = AnalyzerEngine()
+_nlp_engine = NlpEngineProvider(nlp_configuration={
+    "nlp_engine_name": "spacy",
+    "models": [{"lang_code": "es", "model_name": "es_core_news_sm"}],
+}).create_engine()
+
+analyzer = AnalyzerEngine(nlp_engine=_nlp_engine, supported_languages=["es"])
 anonymizer = AnonymizerEngine()
 
 # Expresiones regulares estáticas para cazar DNI y credenciales de infraestructura (AWS)
