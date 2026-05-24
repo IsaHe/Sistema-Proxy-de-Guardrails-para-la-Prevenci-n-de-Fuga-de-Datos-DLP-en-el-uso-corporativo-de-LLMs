@@ -43,31 +43,39 @@ AWS_SECRET_REGEX = re.compile(r'AKIA[0-9A-Z]{16}', re.IGNORECASE)
 MAPPING_STORE: dict[str, str] = {}
 
 def custom_ids_scan(text: str) -> str:
-    """Módulo IDS: Detecta PII y secretos usando NLP y firmas estáticas."""
-    # A. NLP para entidades comunes (Nombres, Emails) con modelo en español
-    analyzer_results = analyzer.analyze(text=text, language="es")
-    anonymized_result = anonymizer.anonymize(
-        text=text,
-        analyzer_results=analyzer_results,
-        operators={
-            "PERSON": OperatorConfig("replace", {"new_value": "[USER_1]"}),
-            "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "[EMAIL_1]"}),
-        }
-    )
-    processed_text = anonymized_result.text
-    
-    # B. RegEx estáticas para DNI
+    """Módulo IDS: Detecta PII y secretos usando firmas estáticas y NLP.
+
+    Las regex corren primero para capturar el valor original en MAPPING_STORE
+    antes de que Presidio reescriba el texto.
+    """
+    processed_text = text
+
+    # A. RegEx estáticas para DNI (debe ir antes que NLP para capturar el valor original)
     for match in DNI_REGEX.findall(processed_text):
         placeholder = "[DNI_1]"
         MAPPING_STORE[placeholder] = match
         processed_text = processed_text.replace(match, placeholder)
-        
-    # C. RegEx estáticas para secretos (Tokens AWS)
+
+    # B. RegEx estáticas para secretos (Tokens AWS)
     for match in AWS_SECRET_REGEX.findall(processed_text):
         placeholder = "[AWS_TOKEN_1]"
         MAPPING_STORE[placeholder] = match
         processed_text = processed_text.replace(match, placeholder)
-        
+
+    # C. NLP para entidades comunes (Nombres, Emails) con modelo en español.
+    #    ES_NIF actúa como red de seguridad por si la regex no captura algún DNI.
+    analyzer_results = analyzer.analyze(text=processed_text, language="es")
+    anonymized_result = anonymizer.anonymize(
+        text=processed_text,
+        analyzer_results=analyzer_results,
+        operators={
+            "PERSON": OperatorConfig("replace", {"new_value": "[USER_1]"}),
+            "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "[EMAIL_1]"}),
+            "ES_NIF": OperatorConfig("replace", {"new_value": "[DNI_1]"}),
+        }
+    )
+    processed_text = anonymized_result.text
+
     return processed_text
 
 def detect_prompt_injection(text: str) -> None:
